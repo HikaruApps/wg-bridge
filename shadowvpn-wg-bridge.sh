@@ -1,193 +1,255 @@
 #!/usr/bin/env bash
-# ShadowVPN WG Bridge — Debian 12/13, IPv4-only, RU Xray(host) -> DE WireGuard NAT.
+# ShadowVPN WG Bridge: Debian 12/13; IPv4; Xray(host network) RU -> WireGuard -> DE NAT.
 set -Eeuo pipefail
 umask 077
+
 WG=wg-shadow
-CFG="/etc/wireguard/${WG}.conf"
 DIR=/etc/shadowvpn-wg-bridge
-NETWORK=10.77.250
-DE_TUN=${NETWORK}.1
-RU_TUN=${NETWORK}.2
-WG_PORT=51820
+CFG="/etc/wireguard/${WG}.conf"
+DE_FW=/usr/local/sbin/shadowvpn-wg-de-fw
+RU_ROUTE=/usr/local/sbin/shadowvpn-wg-ru-route
+DE_FW_UNIT=shadowvpn-wg-de-firewall.service
+NET=10.77.250
+DE_TUN=$NET.1
+RU_TUN=$NET.2
+PORT=51820
 TABLE=177
 MARK=0x177
-RULE_PRIORITY=17700
-fail(){ echo "ERROR: $*" >&2; exit 1; }
-[[ $EUID == 0 ]] || fail 'Run as root.'
-[[ -r /etc/os-release ]] || fail 'Cannot identify OS.'
-. /etc/os-release
-[[ ${ID:-} == debian && ( ${VERSION_ID:-} == 12 || ${VERSION_ID:-} == 13 ) ]] || fail 'Designed for Debian 12/13 only.'
-[[ $# -eq 1 ]] || fail "Usage: $0 de-init | ru-init | de-peer | ru-up | status"
-command -v systemctl >/dev/null || fail 'systemd is required.'
+PRIO=17700
+
+say(){ printf '%s\n' "$*"; }
+fail(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+require_root(){ (( EUID == 0 )) || fail 'Run as root.'; }
+require_debian(){
+  [[ -r /etc/os-release ]] || fail 'Cannot identify OS.'
+  # shellcheck source=/dev/null
+  . /etc/os-release
+  [[ ${ID:-} == debian && ( ${VERSION_ID:-} == 12 || ${VERSION_ID:-} == 13 ) ]] || fail 'Only Debian 12/13 is supported.'
+  command -v systemctl >/dev/null || fail 'systemd is required.'
+}
+confirm_role(){
+  local value
+  read -r -p "This changes networking on the $1 VPS. Type $1 to continue: " value
+  [[ $value == "$1" ]] || fail 'Cancelled.'
+}
 install_deps(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install -y wireguard-tools iproute2 iptables ca-certificates
   install -d -m 700 "$DIR" /etc/wireguard
 }
-check_unused(){
-  [[ ! -e $CFG ]] || fail "$CFG already exists; refusing to overwrite."
-  [[ ! -e $DIR/private.key ]] || fail 'Key already exists; refusing to overwrite.'
-  if ip -4 -o addr show | grep -Eq "(^|[[:space:]])${NETWORK}\\."; then
-    fail "${NETWORK}.0/24 overlaps an existing interface; choose another subnet in the script."
-  fi
-}
-keygen(){ wg genkey > "$DIR/private.key"; wg pubkey < "$DIR/private.key" > "$DIR/public.key"; chmod 600 "$DIR/private.key"; }
+wan_if(){ ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'; }
 valid_key(){ [[ $1 =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
-valid_ipv4(){
-  local a b c d rest
-  IFS=. read -r a b c d rest <<< "$1"
-  [[ -z ${rest:-} && $a =~ ^[0-9]{1,3}$ && $b =~ ^[0-9]{1,3}$ && $c =~ ^[0-9]{1,3}$ && $d =~ ^[0-9]{1,3}$ ]] || return 1
-  for n in "$a" "$b" "$c" "$d"; do ((10#$n <= 255)) || return 1; done
+valid_ip(){
+  local a b c d more n
+  IFS=. read -r a b c d more <<< "$1"
+  [[ -z ${more:-} && $a =~ ^[0-9]{1,3}$ && $b =~ ^[0-9]{1,3}$ && $c =~ ^[0-9]{1,3}$ && $d =~ ^[0-9]{1,3}$ ]] || return 1
+  for n in "$a" "$b" "$c" "$d"; do (( 10#$n <= 255 )) || return 1; done
 }
-public_ip(){
-  ip -4 route get 1.1.1.1 | sed -n 's/.* src \([0-9.]\+\).*/\1/p' | head -1
+no_collision(){
+  [[ ! -e $CFG && ! -e $DIR/private.key ]] || fail "Existing $CFG or key; refusing to overwrite."
+  ! ip -4 -o addr show | grep -Eq "[[:space:]]${NET}\\." || fail "Tunnel subnet ${NET}.0/30 is already in use."
+  ! ip -4 route show table all | grep -Eq "(^|[[:space:]])${NET}\\." || fail "Tunnel subnet ${NET}.0/30 already appears in routes."
+  ! ip link show "$WG" &>/dev/null || fail "Interface $WG already exists."
 }
-wan_if(){ ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1);exit}}'; }
-show_key(){ echo 'PUBLIC KEY (safe to share between your own servers):'; cat "$DIR/public.key"; }
+new_keys(){
+  wg genkey > "$DIR/private.key"
+  wg pubkey < "$DIR/private.key" > "$DIR/public.key"
+  chmod 600 "$DIR/private.key"
+}
+show_pub(){ say 'Public key (safe to exchange with your own servers):'; cat "$DIR/public.key"; }
+install_de_firewall(){
+  cat > "$DE_FW" <<'FW'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+MODE=${1:?mode required}; IF=${2:-wg-shadow}
+[[ $IF == wg-shadow ]] || { echo 'Unexpected interface' >&2; exit 1; }
+WAN=$(< /etc/shadowvpn-wg-bridge/wan)
+[[ $WAN =~ ^[a-zA-Z0-9_.:-]+$ ]] || { echo 'Invalid WAN interface' >&2; exit 1; }
+SRC=10.77.250.2/32
+# iptables-nft is supported. These rules never flush or replace existing chains.
+input_rule=(-i "$WAN" -p udp --dport 51820 -m comment --comment shadowvpn-wg-bridge -j ACCEPT)
+forward_out=(-i "$IF" -o "$WAN" -s "$SRC" -m comment --comment shadowvpn-wg-bridge -j ACCEPT)
+forward_in=(-i "$WAN" -o "$IF" -d "$SRC" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment shadowvpn-wg-bridge -j ACCEPT)
+nat_rule=(-s "$SRC" -o "$WAN" -m comment --comment shadowvpn-wg-bridge -j MASQUERADE)
+add_filter(){ local chain=$1; shift; iptables -w -C "$chain" "$@" 2>/dev/null || iptables -w -I "$chain" 1 "$@"; }
+del_filter(){ local chain=$1; shift; iptables -w -D "$chain" "$@" 2>/dev/null || true; }
+add_nat(){ iptables -w -t nat -C POSTROUTING "${nat_rule[@]}" 2>/dev/null || iptables -w -t nat -A POSTROUTING "${nat_rule[@]}"; }
+del_nat(){ iptables -w -t nat -D POSTROUTING "${nat_rule[@]}" 2>/dev/null || true; }
+case "$MODE" in
+  allow) add_filter INPUT "${input_rule[@]}" ;;
+  unallow) del_filter INPUT "${input_rule[@]}" ;;
+  up)
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    add_filter INPUT "${input_rule[@]}"
+    add_filter FORWARD "${forward_out[@]}"
+    add_filter FORWARD "${forward_in[@]}"
+    add_nat
+    ;;
+  down)
+    del_nat
+    del_filter FORWARD "${forward_in[@]}"
+    del_filter FORWARD "${forward_out[@]}"
+    # INPUT is owned by the separate persistent firewall service.
+    ;;
+  *) echo "Unknown firewall mode: $MODE" >&2; exit 2 ;;
+esac
+FW
+  chmod 700 "$DE_FW"
+  bash -n "$DE_FW"
+  cat > "/etc/systemd/system/$DE_FW_UNIT" <<EOF
+[Unit]
+Description=ShadowVPN WireGuard inbound UDP firewall rule
+After=network-online.target
+Before=wg-quick@${WG}.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${DE_FW} allow ${WG}
+ExecStop=${DE_FW} unallow ${WG}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now "$DE_FW_UNIT"
+  # Persist global forwarding; no default routes are modified.
+  printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/90-shadowvpn-wg-forward.conf
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+}
+install_ru_route(){
+  cat > "$RU_ROUTE" <<'ROUTE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+MODE=${1:?mode required}; IF=${2:?interface required}
+[[ $IF == wg-shadow ]] || exit 2
+TABLE=177; MARK=0x177; PRIO=17700
+case "$MODE" in
+  up)
+    ip -4 route replace default dev "$IF" src 10.77.250.2 table "$TABLE"
+    if ! ip -4 rule show | grep -Eq '^17700:[[:space:]]+from all fwmark 0x177 lookup 177([[:space:]]|$)'; then
+      ip -4 rule add priority "$PRIO" fwmark "$MARK" lookup "$TABLE"
+    fi
+    ;;
+  down)
+    ip -4 rule del priority "$PRIO" fwmark "$MARK" lookup "$TABLE" 2>/dev/null || true
+    ip -4 route del default dev "$IF" table "$TABLE" 2>/dev/null || true
+    ;;
+  *) exit 2 ;;
+esac
+ROUTE
+  chmod 700 "$RU_ROUTE"
+  bash -n "$RU_ROUTE"
+}
+check_ru_policy(){
+  ! ip -4 rule show | grep -Eq "^${PRIO}:" || fail "IP rule priority $PRIO already used."
+  [[ -z $(ip -4 route show table "$TABLE") ]] || fail "Routing table $TABLE already contains routes."
+}
+require_root
+require_debian
+[[ $# == 1 ]] || fail "Usage: $0 de-init | ru-init | de-peer | de-repair | ru-up | status"
 case "$1" in
   de-init)
-    check_unused
-    echo 'Germany: this installs a dedicated WG interface and scoped NAT; it does not change the default route.'
-    read -r -p 'Proceed on GERMAN VPS? Type DE: ' confirm
-    [[ $confirm == DE ]] || fail 'Cancelled.'
-    WAN=$(wan_if); [[ -n $WAN ]] || fail 'Cannot identify WAN interface.'
-    echo "Detected WAN: $WAN"
-    install_deps; keygen
-    # No peer until de-peer; WG service is started only after public key of RU is known.
+    no_collision
+    confirm_role DE
+    WAN=$(wan_if); [[ -n $WAN ]] || fail 'Could not detect external interface.'
+    install_deps
+    new_keys
+    printf '%s\n' "$WAN" > "$DIR/wan"
+    install_de_firewall
     cat > "$CFG" <<EOF
 [Interface]
 Address = ${DE_TUN}/30
-ListenPort = ${WG_PORT}
-PrivateKey = $(cat "$DIR/private.key")
+ListenPort = ${PORT}
+PrivateKey = $(< "$DIR/private.key")
 Table = off
-PostUp = /usr/local/sbin/shadowvpn-wg-de-fw up %i
-PostDown = /usr/local/sbin/shadowvpn-wg-de-fw down %i
+PostUp = ${DE_FW} up %i
+PostDown = ${DE_FW} down %i
 EOF
     chmod 600 "$CFG"
-    printf '%s\n' "$WAN" > "$DIR/wan"
-    cat > /usr/local/sbin/shadowvpn-wg-de-fw <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-MODE=${1:?}; IF=${2:?}
-[[ $IF == wg-shadow ]] || exit 1
-WAN=$(cat /etc/shadowvpn-wg-bridge/wan)
-SRC=10.77.250.2/32
-rule(){
-  local op=$1; shift
-  if [[ $op == up ]]; then
-    iptables -w -C "$@" 2>/dev/null || iptables -w -A "$@"
-  else
-    iptables -w -D "$@" 2>/dev/null || true
-  fi
-}
-case $MODE in
-  up)
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    ip route replace 10.77.250.2/32 dev "$IF"
-    rule up FORWARD -i "$IF" -o "$WAN" -s "$SRC" -j ACCEPT
-    rule up FORWARD -i "$WAN" -o "$IF" -d "$SRC" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    rule up -t nat POSTROUTING -s "$SRC" -o "$WAN" -j MASQUERADE
-    ;;
-  down)
-    rule down -t nat POSTROUTING -s "$SRC" -o "$WAN" -j MASQUERADE
-    rule down FORWARD -i "$WAN" -o "$IF" -d "$SRC" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    rule down FORWARD -i "$IF" -o "$WAN" -s "$SRC" -j ACCEPT
-    ip route del 10.77.250.2/32 dev "$IF" 2>/dev/null || true
-    ;;
-  *) exit 1;;
-esac
-EOF
-    chmod 700 /usr/local/sbin/shadowvpn-wg-de-fw
-    cat > /etc/sysctl.d/90-shadowvpn-wg-forward.conf <<'EOF'
-net.ipv4.ip_forward = 1
-EOF
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    echo "DE init done. WAN=$WAN; WG UDP port=$WG_PORT. Allow incoming UDP $WG_PORT in provider firewall if needed."
-    show_key
-    echo 'Next: run ru-init on Russia, then de-peer on Germany, then ru-up on Russia.'
+    say "Germany initialized: WAN=$WAN, UDP=$PORT, no default-route change."
+    say 'Check provider firewall permits inbound UDP 51820 from the Russian VPS.'
+    show_pub
+    say 'Next: ru-init on Russia, then de-peer on Germany, then ru-up on Russia.'
     ;;
   ru-init)
-    check_unused
-    echo 'Russia: wg-quick Table=off. Only sockets explicitly marked by Xray can use the dedicated routing table.'
-    read -r -p 'Proceed on RUSSIAN VPS? Type RU: ' confirm
-    [[ $confirm == RU ]] || fail 'Cancelled.'
+    no_collision
+    check_ru_policy
+    confirm_role RU
     read -r -p 'German VPS public IPv4: ' DE_IP
-    valid_ipv4 "$DE_IP" || fail 'Invalid IPv4.'
-    read -r -p 'German WG public key (from de-init): ' DE_PUB
-    valid_key "$DE_PUB" || fail 'Invalid WireGuard public key.'
-    # Ensure no overlapping assigned address before installing.
-    ip -4 -o addr show | grep -Eq "(^|[[:space:]])${NETWORK}\\." && fail 'Tunnel subnet overlaps existing interface.' || true
-    install_deps; keygen
+    valid_ip "$DE_IP" || fail 'Invalid IPv4 address.'
+    read -r -p 'German WireGuard public key: ' DE_PUB
+    valid_key "$DE_PUB" || fail 'Invalid public key.'
+    install_deps
+    new_keys
     cat > "$CFG" <<EOF
 [Interface]
 Address = ${RU_TUN}/30
-PrivateKey = $(cat "$DIR/private.key")
+PrivateKey = $(< "$DIR/private.key")
 Table = off
-PostUp = /usr/local/sbin/shadowvpn-wg-ru-route up %i
-PostDown = /usr/local/sbin/shadowvpn-wg-ru-route down %i
+PostUp = ${RU_ROUTE} up %i
+PostDown = ${RU_ROUTE} down %i
 
 [Peer]
-PublicKey = $DE_PUB
-Endpoint = ${DE_IP}:${WG_PORT}
+PublicKey = ${DE_PUB}
+Endpoint = ${DE_IP}:${PORT}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
     chmod 600 "$CFG"
-    cat > /usr/local/sbin/shadowvpn-wg-ru-route <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-MODE=${1:?}; IF=${2:?}
-[[ $IF == wg-shadow ]] || exit 1
-MARK=0x177; TABLE=177; PRIORITY=17700
-case $MODE in
-  up)
-    ip route replace default dev "$IF" src 10.77.250.2 table "$TABLE"
-    ip rule show | grep -qE '^17700:.*fwmark 0x177.*lookup 177' || ip rule add priority "$PRIORITY" fwmark "$MARK" lookup "$TABLE"
-    ip -4 route flush cache
-    ;;
-  down)
-    ip rule del priority "$PRIORITY" fwmark "$MARK" lookup "$TABLE" 2>/dev/null || true
-    ip route flush table "$TABLE" 2>/dev/null || true
-    ip -4 route flush cache
-    ;;
-  *) exit 1;;
-esac
-EOF
-    chmod 700 /usr/local/sbin/shadowvpn-wg-ru-route
-    echo 'RU initialized but WG NOT STARTED. Public key below; use it with de-peer on Germany.'
-    show_key
+    install_ru_route
+    say 'Russia initialized but WireGuard NOT STARTED.'
+    show_pub
+    say 'Next: de-peer on Germany, then ru-up on Russia.'
     ;;
   de-peer)
-    [[ -f $CFG && -f $DIR/public.key ]] || fail 'Run de-init first.'
-    grep -q '^\[Peer\]' "$CFG" && fail 'A peer already exists. No automatic overwrite.'
-    read -r -p 'Russian WG public key (from ru-init): ' RU_PUB
-    valid_key "$RU_PUB" || fail 'Invalid WireGuard public key.'
+    [[ -f $CFG && -f $DIR/public.key && -f $DIR/wan ]] || fail 'Run de-init first.'
+    ! grep -q '^\[Peer\]' "$CFG" || fail 'Peer already configured; refusing overwrite.'
+    confirm_role DE
+    read -r -p 'Russian WireGuard public key: ' RU_PUB
+    valid_key "$RU_PUB" || fail 'Invalid public key.'
     cat >> "$CFG" <<EOF
 
 [Peer]
-PublicKey = $RU_PUB
+PublicKey = ${RU_PUB}
 AllowedIPs = ${RU_TUN}/32
 EOF
+    # Even on an existing host, make sure the dedicated INPUT rule is persistent.
+    [[ -x $DE_FW ]] || fail "Missing $DE_FW; use de-repair first."
+    systemctl enable --now "$DE_FW_UNIT"
     systemctl enable --now "wg-quick@${WG}.service"
     wg show "$WG"
-    echo 'Germany WG is running; now run ru-up on Russia.'
+    say 'Germany running. Next: ru-up on Russia.'
+    ;;
+  de-repair)
+    # Upgrade only this project's firewall helper; preserve WG keys, config and peers.
+    [[ -f $CFG && -f $DIR/wan && -f $DIR/private.key ]] || fail 'Existing ShadowVPN DE setup not found.'
+    grep -Fq "PostUp = ${DE_FW} up %i" "$CFG" || fail 'Unexpected WG config; refusing to replace firewall helper.'
+    grep -Eq '^Address = 10\.77\.250\.1/30$' "$CFG" || fail 'Unexpected tunnel address.'
+    confirm_role DE
+    install_de_firewall
+    if systemctl is-active --quiet "wg-quick@${WG}.service"; then
+      "$DE_FW" up "$WG"  # Apply the fixed NAT/FORWARD rules without restarting an active tunnel.
+    fi
+    say 'German firewall helper upgraded; WG configuration and keys unchanged.'
+    say 'Verify: wg show wg-shadow; systemctl status shadowvpn-wg-de-firewall --no-pager'
     ;;
   ru-up)
-    [[ -f $CFG ]] || fail 'Run ru-init first.'
+    [[ -f $CFG && -x $RU_ROUTE ]] || fail 'Run ru-init first.'
+    confirm_role RU
     systemctl enable --now "wg-quick@${WG}.service"
-    echo 'Russia WG started. Main route (should still be via original WAN):'
-    ip -4 route show default
-    echo 'Marked route (should be via wg-shadow):'
-    ip -4 route get 1.1.1.1 mark "$MARK"
-    echo 'Handshake may take a few seconds; check: wg show wg-shadow'
-    echo 'DO NOT route all Xray traffic yet. First validate the tunnel and add an isolated inbound routing rule.'
+    say 'Main IPv4 route (must still use normal WAN):'; ip -4 route show default
+    say 'Marked IPv4 route (must use wg-shadow):'; ip -4 route get 1.1.1.1 mark "$MARK"
+    say 'Check wg show wg-shadow and ping -c 4 -I wg-shadow 10.77.250.1 before changing Xray.'
     ;;
   status)
+    systemctl is-active "wg-quick@${WG}.service" || true
     ip -4 route show default
     ip -4 rule show
     ip -4 route show table "$TABLE" || true
     wg show "$WG" || true
     ;;
-  *) fail 'Unknown mode.';;
+  *) fail 'Unknown mode.' ;;
 esac
