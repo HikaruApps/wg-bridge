@@ -1,246 +1,139 @@
-# ShadowVPN WG Bridge
+# ShadowVPN WG Bridge — Multi-location manager (preview)
 
-A small, self-hosted Bash installer for a **selective Russia → Germany egress bridge**:
+Интерактивная настройка **нескольких независимых** IPv4-мостов WireGuard между одной входной нодой (ENTRY, например Россия с RemnaNode/Xray) и несколькими выходными VPS (EXIT, например Германия, Эстония, Финляндия). Один новый мост — один отдельный WG-интерфейс, подсеть, порт на выходном VPS, таблица, `fwmark` и Xray outbound. Пользователь выбирает локацию через отдельный inbound/профиль; **балансировки и автоматического failover нет**.
+
+> **Статус: preview.** Проверены синтаксис Bash и неразрушающий запуск меню; реальный сетевой запуск на ваших VPS и восстановление после перезагрузки **не проверены**. Не выкатывайте сразу на всех пользователей. Нужна аварийная консоль провайдера, резервная копия конфигураций и тест на одной новой локации.
+
+## Как это устроено
 
 ```text
-Selected VPN client
-       │  Xray inbound (RU)
-       ▼
-RU: RemnaNode / Xray ── WireGuard (UDP/51820) ──► DE: WireGuard ── NAT ──► Internet
-       │                                              
-       └─ SSH, Remnawave management and other inbounds stay on their existing routes
+                          ┌── existing wg-shadow → Germany → Internet
+Client → RU ENTRY / Xray ─┤
+                          ├── wg-estonia → Estonia → Internet
+                          └── wg-finland → Finland → Internet
+
+    Inbound DE → freedom outbound mark 375 → existing table 177
+    Inbound EE → freedom outbound mark 376 → new table 178
+    Inbound FI → freedom outbound mark 377 → new table 179
 ```
 
-The German VPS provides the public egress IPv4 address. The Russian VPS keeps its existing default route. The script creates a separate routing table (`177`) and an IP rule for packets explicitly marked `0x177` (decimal `375`). **It does not automatically route any Xray inbound:** you must configure the outbound and inbound routing in Remnawave after validating the tunnel.
+Менеджер **не управляет и не изменяет** старый `wg-shadow`, `/etc/shadowvpn-wg-bridge`, таблицу 177 или `shadowvpn-wg-bridge.sh`. Старый мост остаётся в своём установщике; новый менеджер лишь сообщает о его наличии. Он не читает/изменяет профили Remnawave, WARP, Psiphon, Docker или серверные правила облачного firewall.
 
-> [!IMPORTANT]
-> This project changes firewall and routing settings on two real servers. Test on staging or during a maintenance window, keep provider-console access available, and review the script before running it as root. It is not a guarantee that SSH or your existing network stack cannot be disrupted. Back up existing firewall and Remnawave config first.
+### Требования и границы
 
-## What it does
+- Debian 12/13, systemd, `root`, IPv4; `wireguard-tools`, `iptables`/`iptables-nft`, `iproute2` устанавливаются менеджером. Нужен `ss` (обычно установлен с `iproute2`).
+- На ENTRY основной IPv4-маршрут остаётся обычным; `Table = off` и таблица для отмеченных Xray-сокетов используются для каждого нового моста. На EXIT включается `net.ipv4.ip_forward=1`, добавляются **точечные** `iptables` INPUT/FORWARD/NAT правила с уникальным комментарием.
+- Провайдерский firewall и дополнительные nftables-цепочки могут блокировать трафик независимо от iptables. Разрешите входящий UDP-порт нового моста на EXIT (желательно только от публичного IPv4 ENTRY). Не сбрасывайте весь firewall.
+- NAT на EXIT отправляет трафик через выбранный WAN-интерфейс. Если на EXIT уже настроен WARP, проверьте, что маршрутизация/правила WARP не перенаправляют исходящие подключения неожиданным образом. Менеджер не меняет WARP.
+- IPv6 **не туннелируется** этим проектом. Выбранный Xray outbound используйте с `domainStrategy: UseIPv4`; проверьте IPv6/UDP-политику клиента и Xray отдельно. Скрипт не гарантирует отсутствие DNS-, IPv6- или QUIC-утечек.
+- Не использовать подсети, интерфейсы, порты, таблицы, метки и приоритеты, занятые другими приложениями/на другой ноде. Локальные проверки не заменяют аудит маршрутизации.
 
-- Installs `wireguard-tools`, `iproute2`, `iptables` and creates one dedicated `wg-shadow` interface on each VPS.
-- Generates separate WireGuard key pairs; **private keys remain on their respective servers**.
-- Germany: configures the peer, a narrowly scoped IPv4 forwarding/NAT rule for `10.77.250.2/32`, and an explicitly scoped incoming UDP/51820 allow rule. A separate enabled systemd unit restores that inbound rule on boot.
-- Russia: uses `Table = off` and routes **only fwmark `0x177`** through table `177` to `wg-shadow`; it does not replace the main default route.
-- Does not change RemnaNode/Xray configs, Docker configuration, remote provider firewalls, SSH settings or any IPv6 routes.
+## Установка менеджера (НА ОБЕИХ нодах)
 
-### Scope and limitations
-
-| Setting | Value |
-| --- | --- |
-| Supported OS | Debian 12/13 with systemd |
-| IP version | IPv4 only |
-| Interface | `wg-shadow` |
-| WG subnet | `10.77.250.0/30`: DE `.1`, RU `.2` |
-| WG listen port | UDP `51820` on DE |
-| Routing table / mark / rule priority | `177` / `0x177` (`375`) / `17700` |
-| Topology | One RU peer and one DE peer; DE performs IPv4 NAT |
-| Xray topology | Designed for RemnaNode / Xray using Docker `network_mode: host` |
-
-The address range, interface name, table, mark and rule priority are currently constants in the script. **Check for conflicts before installing.** There is no automatic multi-bridge allocation, IPv6 forwarding, key rotation, cloud-firewall automation, high availability or continuous health monitoring.
-
-## Prerequisites
-
-1. Two VPS hosts (RU and DE), root privileges, Debian 12 or 13, and provider-console/serial-console access if SSH fails.
-2. RemnaNode/Xray running on RU in **host network mode**. The DE server may also run RemnaNode; the WG configuration is independent of its Xray process.
-3. Ability to permit **incoming UDP/51820 from the RU public IP** in the DE provider firewall. The installer adds an `iptables` INPUT rule, but a provider firewall, other nftables base chains, CrowdSec, or other firewall managers can still deny packets.
-4. An existing IPv4 default route through the normal WAN interface on both servers. Keep your control-plane/SSH access separate from the selected data-plane routing.
-5. No existing `/etc/wireguard/wg-shadow.conf`, `wg-shadow` interface, `10.77.250.0/30` route, or conflicting RU routing table `177` / rule priority `17700`.
-
-### Back up before installation
-
-Run **on both hosts**:
+Лучше проверить код и использовать фиксированный commit/скачанный релиз, а не выполнять `curl | bash`. Менеджер **отдельный файл**, старый `shadowvpn-wg-bridge.sh` оставьте как есть.
 
 ```bash
-mkdir -p /root/wg-bridge-backup
-ip -4 route show table all > /root/wg-bridge-backup/routes.txt
-ip -4 rule show > /root/wg-bridge-backup/rules.txt
-iptables-save > /root/wg-bridge-backup/iptables-save.txt
-nft -a list ruleset > /root/wg-bridge-backup/nft-ruleset.txt
+sudo apt-get update && sudo apt-get install -y git
+# Поместите wg-bridge-manager.sh в /opt/wg-bridge/
+cd /opt/wg-bridge
+bash -n wg-bridge-manager.sh
+sudo chmod 700 wg-bridge-manager.sh
+sudo ./wg-bridge-manager.sh
 ```
 
-If you operate a provider firewall, keep a record of its current rules too. Do **not** restore an old complete firewall dump blindly on a live Docker/RemnaNode host.
+Меню: `1` — подготовить EXIT, `2` — подготовить ENTRY, `3` — добавить публичный ключ ENTRY и запустить EXIT, `4` — запустить ранее подготовленный мост, `5` — остановить один мост, `6` — список, `7` — проверка конкретного моста, `0` — выход. При создании вводите `YES` **только на нужном VPS**. Неверное имя или пересечение адресов вызывает отказ, а не автоматическое изменение существующего моста.
 
-## Installation
-
-Use the GitHub repository you control, review the code, and pin the commit for deployments rather than piping a mutable remote script directly into `bash`.
+### Подготовка / бэкап (оба VPS)
 
 ```bash
-git clone https://github.com/HikaruApps/wg-bridge.git
-cd wg-bridge
-bash -n shadowvpn-wg-bridge.sh
-chmod 700 shadowvpn-wg-bridge.sh
+mkdir -p /root/wg-before-new-bridge
+ip -4 rule show > /root/wg-before-new-bridge/rules.txt
+ip -4 route show table all > /root/wg-before-new-bridge/routes.txt
+iptables-save > /root/wg-before-new-bridge/iptables.txt
+wg show interfaces > /root/wg-before-new-bridge/interfaces.txt
 ```
 
-### 1. Prepare Germany
+Не загружайте в публичные репозитории `/etc/wireguard/*.conf`, private keys, токены Remnawave или дампы секретов. Перед внесением изменений сохраните доступ к консоли у хостера и проверьте, что живой SSH-соединение открыто независимо от новой локации.
 
-On the **German** VPS:
+## Пример: добавить Эстонию, не трогая Германию
 
-```bash
-sudo ./shadowvpn-wg-bridge.sh de-init
-```
+Показанные ниже значения — **пример именно для имеющейся схемы**, не универсальные предустановки. Используйте незанятые значения на *обеих* машинах.
 
-Confirm `DE`. The installer prepares the keys and configuration and enables a dedicated rule allowing UDP/51820 on the detected WAN; **it does not start WireGuard until the RU public key has been registered**. Save the printed **German public key** and make sure the provider firewall allows RU → DE UDP/51820.
+| Параметр | Германия (старый мост) | Эстония (новый) |
+|---|---|---|
+| Название/интерфейс | `wg-shadow` | `estonia` / `wg-estonia` |
+| Туннельная подсеть | `10.77.250.0/30` | `10.77.251.0/30` (в меню: `10.77.251`) |
+| Адрес EXIT / ENTRY | `.1` / `.2` | `10.77.251.1` / `10.77.251.2` |
+| UDP порт EXIT | 51820 | 51821 |
+| Таблица ENTRY | 177 | 178 |
+| `fwmark` Xray (decimal) | 375 | 376 |
+| Priority `ip rule` | 17700 | 17800 |
 
-### 2. Prepare Russia
+**1. На Эстонии (EXIT):** запустите меню → `1`. Имя `estonia`, префикс `10.77.251`, порт `51821`, WAN: `ens3` (если интерфейс по-прежнему такой), публичный IPv4 ENTRY укажите `93.183.80.231` (или актуальный адрес источника, если за NAT/прокси). Сохраните **публичный** WG-ключ EXIT. Это только подготовка; туннель пока не запущен.
 
-On the **Russian** VPS:
+**2. На России (ENTRY):** меню → `2`, то же имя/префикс/порт. Введите актуальный публичный IPv4 EXIT и публичный ключ EXIT, затем свободные таблицу `178`, десятичную метку `376`, приоритет `17800`. Сохраните **публичный** ключ ENTRY. Таблица и правила пока не применяются.
 
-```bash
-sudo ./shadowvpn-wg-bridge.sh ru-init
-```
+**3. На Эстонии:** меню → `3`, выберите `estonia`, вставьте публичный ключ ENTRY. Убедитесь, что на уровне провайдера открыт UDP 51821 от России. Менеджер добавит peer и поднимет `wg-estonia` с локальными firewall/NAT-правилами.
 
-Confirm `RU`, then enter the DE public IPv4 and the **German WireGuard public key**. Save the printed **Russian public key**. This step does **not** start WireGuard or change the default route.
-
-### 3. Register the Russian peer on Germany
-
-On **Germany**:
-
-```bash
-sudo ./shadowvpn-wg-bridge.sh de-peer
-```
-
-Confirm `DE`, paste the **Russian public key**, and check that `wg-quick@wg-shadow.service` starts. The peer config is single-peer by design: rerunning `de-peer` will refuse to append a second peer.
-
-### 4. Bring up Russia
-
-On **Russia**:
+**4. На России:** меню → `4` → `estonia`. После запуска сравните обычный маршрут с отмеченным, убедитесь в handshake и успешном выходе через Эстонию.
 
 ```bash
-sudo ./shadowvpn-wg-bridge.sh ru-up
-```
-
-Confirm `RU`. Verify that the **main default route still uses the original WAN**, and that only the route lookup for mark `0x177` points to `wg-shadow`.
-
-### 5. Validate before touching Xray
-
-On **Russia**:
-
-```bash
-wg show wg-shadow
-ping -c 4 -I wg-shadow 10.77.250.1
+# На ENTRY (Россия)
+wg show wg-estonia
+ping -c 4 -I wg-estonia 10.77.251.1
 ip -4 route show default
-ip -4 route get 1.1.1.1 mark 0x177
+ip -4 route get 1.1.1.1 mark 376
 ip -4 route get 1.1.1.1
+curl -4 --interface wg-estonia --connect-timeout 5 --max-time 20 https://api.ipify.org
+
+# Старый немецкий мост должен остаться на месте
+wg show wg-shadow
+ip -4 route get 1.1.1.1 mark 375
 ```
 
-Expected: a recent WireGuard handshake, received **and** sent bytes, replies from `10.77.250.1`, a marked route through `wg-shadow`, and an unmarked route through the normal WAN. A successful handshake alone **does not** prove that NAT or the eventual Xray egress works.
+Ожидается: обычный маршрут через WAN России, `mark 375` — через `wg-shadow`, `mark 376` — через `wg-estonia`, последний `curl` — публичный IPv4 Эстонии. При отсутствии handshake сначала проверьте provider firewall, затем на EXIT `wg show wg-estonia` и `tcpdump -ni ens3 'udp port 51821'` (если `tcpdump` установлен). Дошедшие в tcpdump пакеты могут быть заблокированы INPUT/nftables до WG; не считайте tcpdump подтверждением успешно работающего туннеля.
 
-Check egress from the selected Xray inbound in the next step (e.g. with an IP-echo site). The selected inbound should show the DE public IPv4; a normal RU inbound and SSH should retain their current behavior.
+## Новый inbound и outbound в Remnawave/Xray
 
-## Remnawave / Xray: route only the chosen inbound
-
-WireGuard is a transport here, not an Xray outbound protocol. Add a **`freedom` outbound** in your RU Remnawave Config Profile, and set `sockopt.mark` to decimal `375` (`0x177`). Then route only the desired inbound tag to that outbound.
-
-Example **outbound object** (merge it into the profile's existing `outbounds` array; it is not a complete standalone Xray config):
+После проверки туннеля на ENTRY добавьте **отдельный** inbound для Эстонии с уникальным портом/тегом и `freedom` outbound, указывающий на специальную метку. Пример объекта в `outbounds`:
 
 ```json
 {
-  "tag": "wg-de-egress",
+  "tag": "WG_EE",
   "protocol": "freedom",
-  "settings": { "domainStrategy": "UseIP" },
-  "streamSettings": {
-    "sockopt": { "mark": 375 }
-  }
+  "settings": {"domainStrategy": "UseIPv4"},
+  "streamSettings": {"sockopt": {"mark": 376}}
 }
 ```
 
-Example **routing rule** (place it before any broad catch-all rule in the RU profile; replace `YOUR_RU_INBOUND_TAG` with the actual inbound tag shown in that profile):
+Пример правила для массива `routing.rules`:
 
 ```json
 {
   "type": "field",
-  "inboundTag": ["YOUR_RU_INBOUND_TAG"],
-  "outboundTag": "wg-de-egress"
+  "inboundTag": ["VLESS_GRPC_REALITY_EE_BRIDGE"],
+  "outboundTag": "WG_EE"
 }
 ```
 
-Apply the change through Remnawave's Config Profile management, validate the full generated Xray config before deployment, then test **only the selected inbound**. Do not paste a standalone JSON fragment into an unrelated config field or edit a generated container file that the panel will overwrite. If multiple groups share the same inbound, this rule routes **all** traffic on that inbound, not an individually selected subscription/user. DNS resolution, IPv6 addresses, sniffing and other routing rules need to be evaluated for your specific Xray profile; this installer does not solve them automatically.
+Тег должен **точно совпадать** с тегом созданного inbound. Поместите правило перед более широкими правилами, способными перехватить тот же inbound; сохраните существующие правила `PSIPHON_GEMINI` и `WG_DE` в нужном порядке. В Xray первое совпавшее правило определяет outbound. Не ставьте mark глобально для RemnaNode/SSH. `SO_MARK` должен быть доступен процессу Xray с соответствующими правами; проверьте реальный выход с клиентского устройства, а не только `ip route get`.
 
-> [!WARNING]
-> The marked outbound uses a separate routing table: do **not** set `mark: 375` globally for all Xray outbounds, the RemnaNode control-plane or SSH. Do not set a new OS-wide default route to `wg-shadow`.
+**Psiphon** для Gemini (если используется) — отдельный маршрут. Не назначайте UDP в SOCKS5 Psiphon: этот прокси поддерживает TCP. Наличие эстонского моста не требует переустановки Psiphon.
 
-## Commands and maintenance
+## Дополнительные локации
 
-```bash
-# Either server: status
-sudo ./shadowvpn-wg-bridge.sh status
+Повторяйте те же 4 этапа, меняя имя/интерфейс, подсеть, EXIT UDP-порт, таблицу, марку и приоритет. Пример для Финляндии: `finland` → `wg-finland`, `10.77.252.0/30`, UDP `51822`, table `179`, mark `377`, priority `17900` **только если всё свободно**. Менеджер не распределяет эти значения автоматически, чтобы не подбирать параметры вслепую на двух независимых VPS.
 
-# Germany: persistent inbound firewall rule
-systemctl status shadowvpn-wg-de-firewall --no-pager
-iptables -S INPUT | grep shadowvpn-wg-bridge
-iptables -t nat -S POSTROUTING | grep shadowvpn-wg-bridge
-
-# Both: tunnel and handshake
-systemctl status wg-quick@wg-shadow --no-pager
-wg show wg-shadow
-
-# Germany: check whether UDP packets reach the host
-sudo tcpdump -ni eth0 'udp port 51820'
-```
-
-The `tcpdump` example requires `tcpdump` to be installed and assumes Germany's external interface is `eth0`. Substitute the actual external interface if different. Only public keys should be exchanged between servers; never publish `/etc/wireguard/wg-shadow.conf` or `/etc/shadowvpn-wg-bridge/private.key`.
-
-### Upgrade an existing German install from the initial script
-
-The **initial version** of the installer used `iptables -C -t nat ...` in the wrong order and failed while starting WireGuard. It also relied on a manually added, non-persistent UDP INPUT rule. After updating this repository, run **only on Germany**:
+## Состояние и остановка
 
 ```bash
-cd /opt/wg-bridge
-git pull
-sudo ./shadowvpn-wg-bridge.sh de-repair
-systemctl status shadowvpn-wg-de-firewall --no-pager
-wg show wg-shadow
+systemctl status wg-quick@wg-estonia --no-pager
+wg show wg-estonia
+# На EXIT: только правила нового моста
+iptables -S INPUT | grep shadowvpn-wg-estonia
+iptables -t nat -S POSTROUTING | grep shadowvpn-wg-estonia
 ```
 
-`de-repair` checks for the project's existing WG config, replaces only the project's DE firewall helper, enables the persistent INPUT rule and reapplies the corrected NAT/FORWARD rules without restarting an already-active tunnel. It preserves your WG keys and peer configuration. If the older installation was manually changed beyond the expected project layout, the command refuses to overwrite it; inspect differences first. **You do not need to rerun `ru-init` or regenerate either key pair.**
+Сначала уберите правило `WG_EE` из Remnawave или переведите пользователей на другой выход. Затем на ENTRY и EXIT отдельно: меню → `5` → `estonia` → `YES`. Остановка отключает только `wg-quick@wg-estonia` и вызывает принадлежащие этому профилю `PostDown`-хуки; другие профили и `wg-shadow` не останавливаются. Не удаляйте вручную общие iptables-цепочки или таблицы маршрутизации. Менеджер намеренно **не предоставляет автоматического удаления профиля/ключей**: архивируйте конфигурацию и проводите удаление отдельно после проверки отсутствия зависимостей.
 
-The persistent INPUT helper runs during boot before WG starts. If another firewall manager later flushes/replaces the INPUT chain, restart the helper and recheck connectivity:
-
-```bash
-sudo systemctl restart shadowvpn-wg-de-firewall
-```
-
-A separate provider firewall or an nftables chain with a DROP verdict may still prevent packets reaching WireGuard, even if this helper reports success. Verify a new handshake after reboot and after firewall reloads.
-
-## Troubleshooting
-
-| Symptom | Check |
-| --- | --- |
-| `Bad argument 'nat'` | You are using the original firewall helper; update and run `de-repair` on DE. |
-| Packets arrive on DE UDP/51820, no handshake | Check DE provider/local INPUT filtering and that the peer public keys match. A packet seen in `tcpdump` may still be dropped before the UDP socket. |
-| Handshake works, ping fails | Verify `10.77.250.1/30` and `.2/30`, WG AllowedIPs and host INPUT/OUTPUT rules. |
-| Ping works, no Internet via chosen Xray inbound | Check DE forwarding/NAT, Xray outbound mark, inbound routing-rule order, IP family and DNS. |
-| SSH affected | Stop modifying rules and recover through the provider console; check that main/default routes and any globally marked sockets are unchanged. |
-| Works until reboot or firewall reload | Check `shadowvpn-wg-de-firewall`, `wg-quick@wg-shadow`, provider firewall, and rules installed by other managers. |
-
-### Stop / roll back this bridge
-
-First remove or disable the dedicated `wg-de-egress` routing rule in Remnawave so affected users do not route into a stopped tunnel. Then:
-
-On **RU**:
-
-```bash
-sudo systemctl disable --now wg-quick@wg-shadow
-```
-
-On **DE**:
-
-```bash
-sudo systemctl disable --now wg-quick@wg-shadow
-sudo systemctl disable --now shadowvpn-wg-de-firewall
-```
-
-The WG `PostDown` hooks remove this project's marked route/rule (RU), or its NAT/FORWARD entries (DE). The separate DE firewall service removes this project's UDP INPUT allow rule. Do **not** flush entire firewall chains or system-wide route tables. The installer does not automatically reverse the DE `net.ipv4.ip_forward=1` sysctl or delete stored keys/configuration; review whether other services rely on forwarding before modifying it.
-
-## Security and operational notes
-
-- Treat SSH, config profiles, WG private keys and the DE endpoint IP as sensitive. Do not commit generated secrets or provider credentials to GitHub.
-- Use a DE provider firewall allow-list for RU's public IP where possible. The local firewall rule is intentionally narrow in port/interface, but is not source-IP constrained because RU may change addresses; harden it for your deployment.
-- A successful tunnel test does not establish production suitability. Measure latency, throughput, packet loss and reconnection across restarts before directing paying users to it.
-- WireGuard encrypts the RU↔DE hop. The DE host still sees and forwards egress traffic. This is **not** end-to-end encryption from the VPN client to the destination website.
-- No claims of third-party security audits, universal DPI bypass, zero logs or a specific uptime SLA are made.
-
-## License and contributions
-
-No license has been granted by this README. Add a `LICENSE` file for your chosen license **before** inviting others to reuse or modify this project. Contributions should include the OS/network topology, redacted service logs, clear reproduction steps and, where possible, regression tests for routing/firewall changes. Do not submit WG private keys, tokens or live subscription URLs.
+**Ограничения:** IPv6 не поддерживается; обработка ошибок во время частично выполненных `PostUp` не является транзакционной; после аварийного выключения может потребоваться проверка/удаление точечных правил по комментарию конкретного моста. Успех `bash -n` не заменяет тест загрузки, восстановления после reboot, iptables/nftables и provider firewall.
